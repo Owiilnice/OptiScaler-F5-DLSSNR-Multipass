@@ -180,22 +180,12 @@ float HaltonSequence(int index, int base)
 }
 
 // One instance per device, for the driver's life.
+// Disabled: shifting the finished picture is resampling, not jitter, so it cannot add the sub-pixel samples DLSS needs. The
+// real jitter has to reach the game's projection matrix (hooks/D3D11_Hooks.cpp, CbProbe).
 JitterShift_Dx12* JitterShiftFor(ID3D12Device* device)
 {
-    static JitterShift_Dx12* instance = nullptr;
-    static ID3D12Device* owner = nullptr;
-
-    if (device == nullptr)
-        return nullptr;
-
-    if (instance == nullptr || owner != device)
-    {
-        instance = new JitterShift_Dx12("JitterShift", device);
-        owner = device;
-        LOG_INFO("Jitter shift: {}", instance->IsInit() ? "ready" : "not available");
-    }
-
-    return instance->IsInit() ? instance : nullptr;
+    (void) device;
+    return nullptr;
 }
 
 namespace native

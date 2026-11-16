@@ -18,6 +18,10 @@
 #include <d3d11on12.h>
 #include <dxgi1_6.h>
 
+#include <cmath>
+#include <unordered_map>
+#include <vector>
+
 #include "Hook_Utils.h"
 #include "FG_Hooks.h"
 #include "DxgiFactory_Hooks.h"
@@ -103,8 +107,208 @@ static inline D3D11_FILTER UpgradeToAF(D3D11_FILTER f)
     return D3D11_FILTER_ANISOTROPIC;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// CbProbe: find the game's projection matrix in its D3D11 constant buffers.
+//
+// DLSS can only antialias with real per-frame sub-pixel jitter of the projection matrix; a game with no upscaler never
+// hands one over. This probe only observes: it records every constant buffer write and reports the 4x4 windows whose
+// entries change by a fraction of a unit between frames -- the signature of a jittered projection matrix. Nothing is
+// modified, so it is safe to run with any settings.
+// ---------------------------------------------------------------------------------------------------------------
+using PFN_MapCb = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT,
+                                             D3D11_MAPPED_SUBRESOURCE*);
+using PFN_UnmapCb = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
+using PFN_UpdateSubCb = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*,
+                                                 UINT, UINT);
+
+static PFN_MapCb o_CbMap = nullptr;
+static PFN_UnmapCb o_CbUnmap = nullptr;
+static PFN_UpdateSubCb o_CbUpdateSub = nullptr;
+static bool _cbProbeInstalled = false;
+
+struct CbPending
+{
+    ID3D11Resource* resource;
+    const void* data;
+    UINT bytes;
+};
+
+static std::vector<CbPending> _cbPending;
+static std::unordered_map<ID3D11Resource*, std::vector<float>> _cbPrev;
+static std::unordered_map<ID3D11Resource*, UINT> _cbSizes;
+static int _cbLogged = 0;
+static int _cbSizesLogged = 0;
+
+static bool CbIsConstantBuffer(ID3D11Resource* res, UINT* bytes)
+{
+    ID3D11Buffer* buffer = nullptr;
+
+    if (res == nullptr || FAILED(res->QueryInterface(IID_PPV_ARGS(&buffer))) || buffer == nullptr)
+        return false;
+
+    D3D11_BUFFER_DESC desc {};
+    const bool constant = SUCCEEDED(buffer->GetDesc(&desc)) && (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 &&
+                          desc.ByteWidth >= 64 && desc.ByteWidth <= 16384;
+
+    if (constant && bytes != nullptr)
+        *bytes = desc.ByteWidth;
+
+    buffer->Release();
+    return constant;
+}
+
+static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
+{
+    if (res == nullptr || data == nullptr || bytes < 64)
+        return;
+
+    const UINT count = bytes / 4;
+    const float* cur = (const float*) data;
+
+    if (_cbSizes.find(res) == _cbSizes.end())
+    {
+        _cbSizes[res] = bytes;
+
+        if (++_cbSizesLogged <= 12)
+            LOG_INFO("CbProbe: constant buffer {}B, first floats {:.4f} {:.4f} {:.4f} {:.4f}", bytes, cur[0], cur[1], cur[2],
+                     cur[3]);
+    }
+
+    auto& prev = _cbPrev[res];
+
+    if (prev.size() != count)
+    {
+        prev.assign(cur, cur + count);
+        return;
+    }
+
+    for (UINT off = 0; off + 16 <= count && _cbLogged < 40; off += 4)
+    {
+        int changed = 0;
+        int firstIndex = -1;
+        float maxDelta = 0.0f;
+
+        for (int i = 0; i < 16; i++)
+        {
+            float d = fabsf(cur[off + i] - prev[off + i]);
+
+            if (d > 1e-7f)
+            {
+                changed++;
+                firstIndex = firstIndex < 0 ? i : firstIndex;
+                maxDelta = d > maxDelta ? d : maxDelta;
+            }
+        }
+
+        // A jittered projection matrix moves one or two entries by well under a unit and leaves the rest alone.
+        if (changed >= 1 && changed <= 4 && maxDelta < 0.02f)
+        {
+            LOG_INFO("CbProbe: {:p} {}B off {} changed {} first {} maxDelta {:.6f} | {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} "
+                     "{:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f}",
+                     (void*) res, bytes, off, changed, firstIndex, maxDelta, cur[off], cur[off + 1], cur[off + 2],
+                     cur[off + 3], cur[off + 4], cur[off + 5], cur[off + 6], cur[off + 7], cur[off + 8], cur[off + 9],
+                     cur[off + 10], cur[off + 11], cur[off + 12], cur[off + 13], cur[off + 14], cur[off + 15]);
+            _cbLogged++;
+        }
+    }
+
+    memcpy(prev.data(), cur, count * sizeof(float));
+}
+
+static HRESULT STDMETHODCALLTYPE hkCbMap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT subResource,
+                                         D3D11_MAP mapType, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped)
+{
+    const auto hr = o_CbMap(ctx, res, subResource, mapType, flags, mapped);
+
+    UINT bytes = 0;
+
+    if (SUCCEEDED(hr) && mapped != nullptr && mapped->pData != nullptr && CbIsConstantBuffer(res, &bytes))
+    {
+        // Several buffers can be mapped before the first one is unmapped, so keep them all. A buffer the game never
+        // unmaps would grow the list for ever, hence the cap.
+        if (_cbPending.size() >= 32)
+            _cbPending.erase(_cbPending.begin());
+
+        _cbPending.push_back({ res, mapped->pData, bytes });
+    }
+
+    return hr;
+}
+
+static void STDMETHODCALLTYPE hkCbUnmap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT subResource)
+{
+    for (auto it = _cbPending.begin(); it != _cbPending.end(); ++it)
+    {
+        if (it->resource == res)
+        {
+            CbAnalyze(it->resource, it->data, it->bytes);
+            _cbPending.erase(it);
+            break;
+        }
+    }
+
+    o_CbUnmap(ctx, res, subResource);
+}
+
+static void STDMETHODCALLTYPE hkCbUpdateSub(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT dstSub,
+                                            const D3D11_BOX* box, const void* data, UINT rowPitch, UINT depthPitch)
+{
+    UINT bytes = 0;
+
+    if (data != nullptr && CbIsConstantBuffer(res, &bytes))
+    {
+        // A constant buffer is one dimensional: front and back are byte offsets into it.
+        const UINT written = box == nullptr ? bytes : (box->back > box->front ? box->back - box->front : 0);
+        CbAnalyze(res, data, written < bytes ? written : bytes);
+    }
+
+    o_CbUpdateSub(ctx, res, dstSub, box, data, rowPitch, depthPitch);
+}
+
+// The detours sit in the context's own functions, the way the exposure scan hooks the device's resource creation: a COM
+// object keeps its methods at fixed slots whatever interface it really implements.
+static void InstallCbProbe(ID3D11Device* device)
+{
+    if (_cbProbeInstalled || device == nullptr)
+        return;
+
+    ID3D11DeviceContext* ctx = nullptr;
+    device->GetImmediateContext(&ctx);
+
+    if (ctx == nullptr)
+        return;
+
+    PVOID* table = *(PVOID**) ctx;
+
+    o_CbMap = (PFN_MapCb) table[14];
+    o_CbUnmap = (PFN_UnmapCb) table[15];
+    o_CbUpdateSub = (PFN_UpdateSubCb) table[48];
+
+    ctx->Release();
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&) o_CbMap, hkCbMap);
+    DetourAttach(&(PVOID&) o_CbUnmap, hkCbUnmap);
+    DetourAttach(&(PVOID&) o_CbUpdateSub, hkCbUpdateSub);
+
+    if (const auto result = DetourTransactionCommit(); result != NO_ERROR)
+    {
+        LOG_WARN("CbProbe: hooking the context failed ({:X})", (UINT) result);
+        o_CbMap = nullptr;
+        o_CbUnmap = nullptr;
+        o_CbUpdateSub = nullptr;
+        return;
+    }
+
+    _cbProbeInstalled = true;
+    LOG_INFO("CbProbe: watching constant buffer writes (Map {}, Unmap {}, UpdateSubresource {})", 14, 15, 48);
+}
+
 static void HookToDeviceLocal(ID3D11Device* InDevice)
 {
+    InstallCbProbe(InDevice);
+
     // The depth finder hooks the immediate context the first time any D3D11 device is captured, whether or not this device's
     // own sampler hooks are already in (a second call with the same device is a no-op inside Install()).
     GenericDepthDx11::Install(InDevice);
