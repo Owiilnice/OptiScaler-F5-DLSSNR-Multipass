@@ -109,23 +109,31 @@ static inline D3D11_FILTER UpgradeToAF(D3D11_FILTER f)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// CbProbe: find the game's projection matrix in its D3D11 constant buffers.
+// CbProbe: find the game's projection matrix in the D3D11 buffers the game writes.
 //
 // DLSS can only antialias with real per-frame sub-pixel jitter of the projection matrix; a game with no upscaler never
-// hands one over. This probe only observes: it records every constant buffer write and reports the 4x4 windows whose
-// entries change by a fraction of a unit between frames -- the signature of a jittered projection matrix. Nothing is
-// modified, so it is safe to run with any settings.
+// hands one over. ETS2 writes no constant buffer at all through Map/Unmap/UpdateSubresource, so the probe covers the
+// other channels a D3D11.1 renderer can use: UpdateSubresource1, the deferred contexts, and plain buffers that are
+// neither vertex nor index buffers. Nothing is modified, so it is safe to run with any settings.
 // ---------------------------------------------------------------------------------------------------------------
 using PFN_MapCb = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT,
                                              D3D11_MAPPED_SUBRESOURCE*);
 using PFN_UnmapCb = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT);
 using PFN_UpdateSubCb = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*,
                                                  UINT, UINT);
+using PFN_UpdateSub1Cb = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
+                                                  const void*, UINT, UINT, UINT);
+using PFN_CreateDeferredCb = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, UINT, ID3D11DeviceContext**);
 
-static PFN_MapCb o_CbMap = nullptr;
-static PFN_UnmapCb o_CbUnmap = nullptr;
-static PFN_UpdateSubCb o_CbUpdateSub = nullptr;
-static bool _cbProbeInstalled = false;
+// One per concrete context class. A deferred context implements the same methods with different functions, and a hook
+// cannot tell which one called it except through the context's own vtable, so the originals are keyed by that.
+struct CbVtable
+{
+    PFN_MapCb map = nullptr;
+    PFN_UnmapCb unmap = nullptr;
+    PFN_UpdateSubCb updateSub = nullptr;
+    PFN_UpdateSub1Cb updateSub1 = nullptr;
+};
 
 struct CbPending
 {
@@ -134,6 +142,8 @@ struct CbPending
     UINT bytes;
 };
 
+static std::unordered_map<void*, CbVtable> _cbVtables;
+static std::unordered_map<void*, PFN_CreateDeferredCb> _cbDeviceVtables;
 static std::vector<CbPending> _cbPending;
 static std::unordered_map<ID3D11Resource*, std::vector<float>> _cbPrev;
 static std::unordered_map<ID3D11Resource*, UINT> _cbSizes;
@@ -141,10 +151,33 @@ static std::unordered_map<ID3D11Resource*, std::vector<uint8_t>> _cbHits;
 static std::unordered_map<ID3D11Resource*, UINT> _cbWrites;
 static int _cbLogged = 0;
 static int _cbSizesLogged = 0;
+static int _cbOtherLogged = 0;
+static int _cbDeferredContexts = 0;
 static long _cbMapCalls = 0;
+static long _cbUpdateSub1Calls = 0;
+
+static bool CbDescribe(ID3D11Resource* res, UINT* bytes, UINT* bindFlags)
+{
+    ID3D11Buffer* buffer = nullptr;
+
+    if (res == nullptr || FAILED(res->QueryInterface(IID_PPV_ARGS(&buffer))) || buffer == nullptr)
+        return false;
+
+    D3D11_BUFFER_DESC desc {};
+    buffer->GetDesc(&desc);
+    buffer->Release();
+
+    if (bytes != nullptr)
+        *bytes = desc.ByteWidth;
+
+    if (bindFlags != nullptr)
+        *bindFlags = desc.BindFlags;
+
+    return true;
+}
 
 // The game does not jitter its projection matrix, so looking for the movement finds nothing. Dump the whole buffer
-// instead and pick the matrix out by its structure: the last row or column holds a -1, and the two scale terms sit in
+// instead and pick the matrix out by its structure: a -1 in the last row or column, and the two scale terms sit in
 // 0.3..4 for a normal field of view.
 static void CbDump(ID3D11Resource* res, UINT bytes, const float* cur, const char* when)
 {
@@ -164,33 +197,29 @@ static void CbDump(ID3D11Resource* res, UINT bytes, const float* cur, const char
     }
 }
 
-static bool CbIsConstantBuffer(ID3D11Resource* res, UINT* bytes)
-{
-    ID3D11Buffer* buffer = nullptr;
-
-    if (res == nullptr || FAILED(res->QueryInterface(IID_PPV_ARGS(&buffer))) || buffer == nullptr)
-        return false;
-
-    D3D11_BUFFER_DESC desc {};
-    buffer->GetDesc(&desc);
-    buffer->Release();
-
-    const bool constant = (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 && desc.ByteWidth >= 64 &&
-                          desc.ByteWidth <= 16384;
-
-    if (constant && bytes != nullptr)
-        *bytes = desc.ByteWidth;
-
-    return constant;
-}
-
-static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
+static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes, UINT bindFlags)
 {
     if (res == nullptr || data == nullptr || bytes < 64)
         return;
 
     const UINT count = bytes / 4;
     const float* cur = (const float*) data;
+
+    if ((bindFlags & D3D11_BIND_CONSTANT_BUFFER) == 0)
+    {
+        // Geometry is uploaded constantly and would drown the log, and one line per buffer is enough to spot a matrix.
+        if ((bindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER)) != 0 || _cbOtherLogged >= 40 ||
+            _cbWrites[res] != 0)
+            return;
+
+        _cbWrites[res] = 1;
+        _cbOtherLogged++;
+        LOG_INFO("CbProbe: buffer {:p} {}B flags {:X}, first floats {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} "
+                 "{:.5f}",
+                 (void*) res, bytes, bindFlags, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]);
+        return;
+    }
+
     const UINT writes = ++_cbWrites[res];
 
     if (_cbSizes.find(res) == _cbSizes.end())
@@ -269,17 +298,33 @@ static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
     memcpy(prev.data(), cur, count * sizeof(float));
 }
 
+static CbVtable* CbTableFor(ID3D11DeviceContext* ctx)
+{
+    if (ctx == nullptr)
+        return nullptr;
+
+    auto found = _cbVtables.find(*(void**) ctx);
+    return found == _cbVtables.end() ? nullptr : &found->second;
+}
+
 static HRESULT STDMETHODCALLTYPE hkCbMap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT subResource,
                                          D3D11_MAP mapType, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped)
 {
-    const auto hr = o_CbMap(ctx, res, subResource, mapType, flags, mapped);
+    auto table = CbTableFor(ctx);
+
+    if (table == nullptr)
+        return E_FAIL;
+
+    const auto hr = table->map(ctx, res, subResource, mapType, flags, mapped);
 
     UINT bytes = 0;
+    UINT bindFlags = 0;
 
-    if ((++_cbMapCalls % 2000) == 0)
-        LOG_INFO("CbProbe: {} Map calls so far, {} distinct constant buffers", _cbMapCalls, _cbSizes.size());
+    if ((++_cbMapCalls % 5000) == 0)
+        LOG_INFO("CbProbe: {} Map calls so far, {} distinct constant buffers, {} deferred contexts", _cbMapCalls,
+                 _cbSizes.size(), _cbDeferredContexts);
 
-    if (SUCCEEDED(hr) && mapped != nullptr && mapped->pData != nullptr && CbIsConstantBuffer(res, &bytes))
+    if (SUCCEEDED(hr) && mapped != nullptr && mapped->pData != nullptr && CbDescribe(res, &bytes, &bindFlags))
     {
         // Several buffers can be mapped before the first one is unmapped, so keep them all. A buffer the game never
         // unmaps would grow the list for ever, hence the cap.
@@ -298,68 +343,158 @@ static void STDMETHODCALLTYPE hkCbUnmap(ID3D11DeviceContext* ctx, ID3D11Resource
     {
         if (it->resource == res)
         {
-            CbAnalyze(it->resource, it->data, it->bytes);
+            UINT bytes = 0;
+            UINT bindFlags = 0;
+
+            if (CbDescribe(res, &bytes, &bindFlags))
+                CbAnalyze(res, it->data, it->bytes, bindFlags);
+
             _cbPending.erase(it);
             break;
         }
     }
 
-    o_CbUnmap(ctx, res, subResource);
+    if (auto table = CbTableFor(ctx); table != nullptr)
+        table->unmap(ctx, res, subResource);
 }
 
 static void STDMETHODCALLTYPE hkCbUpdateSub(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT dstSub,
                                             const D3D11_BOX* box, const void* data, UINT rowPitch, UINT depthPitch)
 {
     UINT bytes = 0;
+    UINT bindFlags = 0;
 
-    if (data != nullptr && CbIsConstantBuffer(res, &bytes))
+    if (data != nullptr && CbDescribe(res, &bytes, &bindFlags))
     {
-        // A constant buffer is one dimensional: front and back are byte offsets into it.
+        // A buffer is one dimensional: front and back are byte offsets into it.
         const UINT written = box == nullptr ? bytes : (box->back > box->front ? box->back - box->front : 0);
-        CbAnalyze(res, data, written < bytes ? written : bytes);
+        CbAnalyze(res, data, written < bytes ? written : bytes, bindFlags);
     }
 
-    o_CbUpdateSub(ctx, res, dstSub, box, data, rowPitch, depthPitch);
+    if (auto table = CbTableFor(ctx); table != nullptr)
+        table->updateSub(ctx, res, dstSub, box, data, rowPitch, depthPitch);
 }
 
-// The detours sit in the context's own functions, the way the exposure scan hooks the device's resource creation: a COM
-// object keeps its methods at fixed slots whatever interface it really implements.
+static void STDMETHODCALLTYPE hkCbUpdateSub1(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT dstSub,
+                                             const D3D11_BOX* box, const void* data, UINT rowPitch, UINT depthPitch,
+                                             UINT copyFlags)
+{
+    UINT bytes = 0;
+    UINT bindFlags = 0;
+
+    if (++_cbUpdateSub1Calls % 5000 == 0)
+        LOG_INFO("CbProbe: {} UpdateSubresource1 calls so far", _cbUpdateSub1Calls);
+
+    if (data != nullptr && CbDescribe(res, &bytes, &bindFlags))
+    {
+        const UINT written = box == nullptr ? bytes : (box->back > box->front ? box->back - box->front : 0);
+        CbAnalyze(res, data, written < bytes ? written : bytes, bindFlags);
+    }
+
+    if (auto table = CbTableFor(ctx); table != nullptr && table->updateSub1 != nullptr)
+        table->updateSub1(ctx, res, dstSub, box, data, rowPitch, depthPitch, copyFlags);
+}
+
+// Slots 14..116 of one shared table: writing them in place reaches every context of this class, which is what we want,
+// and avoids copying a table whose length depends on the interface the game asked for.
+static void InstallCbHooksOnContext(ID3D11DeviceContext* ctx)
+{
+    if (ctx == nullptr)
+        return;
+
+    void** vt = *(void***) ctx;
+
+    if (_cbVtables.find(vt) != _cbVtables.end())
+        return;
+
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    const bool hasContext1 = SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1)));
+
+    if (ctx1 != nullptr)
+        ctx1->Release();
+
+    CbVtable table {};
+    table.map = (PFN_MapCb) vt[14];
+    table.unmap = (PFN_UnmapCb) vt[15];
+    table.updateSub = (PFN_UpdateSubCb) vt[48];
+
+    if (hasContext1)
+        table.updateSub1 = (PFN_UpdateSub1Cb) vt[116];
+
+    const size_t first = 14;
+    const size_t last = hasContext1 ? 116 : 48;
+    const size_t span = (last - first + 1) * sizeof(void*);
+    DWORD oldProtect = 0;
+
+    if (!VirtualProtect(&vt[first], span, PAGE_READWRITE, &oldProtect))
+    {
+        LOG_WARN("CbProbe: cannot write the context vtable");
+        return;
+    }
+
+    // Registered before the slots are replaced: a hook can fire as soon as the first one is in place.
+    _cbVtables[vt] = table;
+
+    vt[14] = (void*) hkCbMap;
+    vt[15] = (void*) hkCbUnmap;
+    vt[48] = (void*) hkCbUpdateSub;
+
+    if (hasContext1)
+        vt[116] = (void*) hkCbUpdateSub1;
+
+    VirtualProtect(&vt[first], span, oldProtect, &oldProtect);
+    LOG_INFO("CbProbe: context hooked (Map {}, Unmap {}, UpdateSubresource {}, UpdateSubresource1 {})", 14, 15, 48,
+             hasContext1 ? 116 : -1);
+}
+
+static HRESULT STDMETHODCALLTYPE hkCbCreateDeferred(ID3D11Device* device, UINT flags, ID3D11DeviceContext** ctx)
+{
+    auto found = _cbDeviceVtables.find(device == nullptr ? nullptr : *(void**) device);
+
+    if (found == _cbDeviceVtables.end())
+        return E_FAIL;
+
+    const auto hr = found->second(device, flags, ctx);
+
+    if (SUCCEEDED(hr) && ctx != nullptr && *ctx != nullptr)
+    {
+        ++_cbDeferredContexts;
+        InstallCbHooksOnContext(*ctx);
+        LOG_INFO("CbProbe: deferred context {:p}, {} so far", (void*) *ctx, _cbDeferredContexts);
+    }
+
+    return hr;
+}
+
 static void InstallCbProbe(ID3D11Device* device)
 {
-    if (_cbProbeInstalled || device == nullptr)
+    if (device == nullptr)
         return;
 
     ID3D11DeviceContext* ctx = nullptr;
     device->GetImmediateContext(&ctx);
 
-    if (ctx == nullptr)
-        return;
-
-    PVOID* table = *(PVOID**) ctx;
-
-    o_CbMap = (PFN_MapCb) table[14];
-    o_CbUnmap = (PFN_UnmapCb) table[15];
-    o_CbUpdateSub = (PFN_UpdateSubCb) table[48];
-
-    ctx->Release();
-
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-    DetourAttach(&(PVOID&) o_CbMap, hkCbMap);
-    DetourAttach(&(PVOID&) o_CbUnmap, hkCbUnmap);
-    DetourAttach(&(PVOID&) o_CbUpdateSub, hkCbUpdateSub);
-
-    if (const auto result = DetourTransactionCommit(); result != NO_ERROR)
+    if (ctx != nullptr)
     {
-        LOG_WARN("CbProbe: hooking the context failed ({:X})", (UINT) result);
-        o_CbMap = nullptr;
-        o_CbUnmap = nullptr;
-        o_CbUpdateSub = nullptr;
-        return;
+        InstallCbHooksOnContext(ctx);
+        ctx->Release();
     }
 
-    _cbProbeInstalled = true;
-    LOG_INFO("CbProbe: watching constant buffer writes (Map {}, Unmap {}, UpdateSubresource {})", 14, 15, 48);
+    void** vt = *(void***) device;
+
+    if (_cbDeviceVtables.find(vt) != _cbDeviceVtables.end())
+        return;
+
+    _cbDeviceVtables[vt] = (PFN_CreateDeferredCb) vt[27];
+
+    DWORD oldProtect = 0;
+
+    if (VirtualProtect(&vt[27], sizeof(void*), PAGE_READWRITE, &oldProtect))
+    {
+        vt[27] = (void*) hkCbCreateDeferred;
+        VirtualProtect(&vt[27], sizeof(void*), oldProtect, &oldProtect);
+        LOG_INFO("CbProbe: watching deferred context creation");
+    }
 }
 
 static void HookToDeviceLocal(ID3D11Device* InDevice)
