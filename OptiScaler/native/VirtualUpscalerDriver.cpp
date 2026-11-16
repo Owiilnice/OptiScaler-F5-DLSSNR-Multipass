@@ -285,6 +285,7 @@ VirtualUpscalerDriver::~VirtualUpscalerDriver()
     Release();
     ReleaseTexture(_output);
     ReleaseTexture(_input);
+    ReleaseTexture(_jittered);
     ReleaseTexture(_neutralDepth);
 
     if (_rtvHeap != nullptr)
@@ -699,10 +700,19 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
     D3D12_RESOURCE_STATES pictureNow = frame.pictureState;
 
     // Sub-pixel jitter, only with the backend's own pass: a shifted picture handed straight on would make the whole image
-    // wobble, and only a copy we own can be written.
+    // wobble. Its own texture, because the picture's format is often the output's already and then there is no copy to write.
     float jitterX = 0.0f;
     float jitterY = 0.0f;
-    JitterShift_Dx12* jitterShift = route == VuNrRoute::BackendPass && copyIn ? JitterShiftFor(_device) : nullptr;
+    JitterShift_Dx12* jitterShift = nullptr;
+
+    if (route == VuNrRoute::BackendPass)
+    {
+        if (!EnsureTexture(_jittered, _jitteredKey, key, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "jittered"))
+            return false;
+
+        jitterShift = JitterShiftFor(_device);
+    }
 
     if (jitterShift != nullptr)
     {
@@ -711,33 +721,27 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
         jitterY = HaltonSequence((int) _jitterFrame, 3) - 0.5f;
     }
 
-    if (copyIn)
+    if (jitterShift != nullptr)
     {
-        if (jitterShift != nullptr)
+        Transition(cmd, frame.color, pictureNow, kRead);
+        pictureNow = kRead;
+
+        if (!jitterShift->Dispatch(cmd, frame.color, _jittered, jitterX, jitterY, key.width, key.height))
         {
-            Transition(cmd, frame.color, pictureNow, kRead);
-            pictureNow = kRead;
-
-            // _input rests in COPY_DEST (see the end of Run): it has to be a UAV for the shift.
-            Transition(cmd, _input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-            if (!jitterShift->Dispatch(cmd, frame.color, _input, jitterX, jitterY, key.width, key.height))
-            {
-                LOG_WARN("Jitter shift: dispatch failed, no jitter this frame");
-                jitterX = 0.0f;
-                jitterY = 0.0f;
-            }
-
-            Transition(cmd, _input, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, inColor);
-        }
-        else
-        {
-            Transition(cmd, frame.color, pictureNow, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            pictureNow = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            cmd->CopyResource(_input, frame.color);
-            Transition(cmd, _input, D3D12_RESOURCE_STATE_COPY_DEST, inColor);
+            LOG_WARN("Jitter shift: dispatch failed, no jitter this frame");
+            jitterX = 0.0f;
+            jitterY = 0.0f;
         }
 
+        Transition(cmd, _jittered, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, inColor);
+        color = _jittered;
+    }
+    else if (copyIn)
+    {
+        Transition(cmd, frame.color, pictureNow, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        pictureNow = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cmd->CopyResource(_input, frame.color);
+        Transition(cmd, _input, D3D12_RESOURCE_STATE_COPY_DEST, inColor);
         color = _input;
     }
     else
@@ -801,7 +805,7 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
 
     if (passThrough && cfg.FGHUDFix.value_or_default())
     {
-        const auto colorNow = color == _input ? inColor : pictureNow;
+        const auto colorNow = (color == _input || color == _jittered) ? inColor : pictureNow;
         Transition(cmd, color, colorNow, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(cmd, _output, fgOutput, D3D12_RESOURCE_STATE_COPY_DEST);
         cmd->CopyResource(_output, color);
@@ -861,7 +865,8 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
                  : route == VuNrRoute::InPlace ? (nrRan ? "no pass (NR in place)" : "no pass (NR did not run)")
                  : evaluated                 ? "true"
                                              : "false",
-                 _backendName, key.width, key.height, (int) key.format, copyIn ? " (copied)" : "", frame.reset,
+                 _backendName, key.width, key.height, (int) key.format,
+                 jitterShift != nullptr ? " (jittered)" : (copyIn ? " (copied)" : ""), frame.reset,
                  _featureKey.depthReversed);
 
     ++_evaluations;
@@ -873,7 +878,9 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
     Transition(cmd, frame.motion, inMotion, kRead);
     Transition(cmd, depth, inDepth, kRead);
 
-    if (copyIn)
+    if (jitterShift != nullptr)
+        Transition(cmd, _jittered, inColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    else if (copyIn)
         Transition(cmd, _input, inColor, D3D12_RESOURCE_STATE_COPY_DEST);
 
     if (evaluated)

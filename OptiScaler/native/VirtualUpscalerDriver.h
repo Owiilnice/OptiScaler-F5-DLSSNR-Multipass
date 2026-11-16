@@ -108,6 +108,8 @@ class VirtualUpscalerDriver
     Key _outputKey;
     ID3D12Resource* _input = nullptr; // a typed copy of the picture when the picture itself is typeless; rests in COPY_DEST
     Key _inputKey;
+    ID3D12Resource* _jittered = nullptr; // the picture shifted by the sub-pixel jitter; rests in UNORDERED_ACCESS
+    Key _jitteredKey;
     ID3D12Resource* _neutralDepth = nullptr; // all far, for frames with no depth; rests in NON_PIXEL_SHADER_RESOURCE
     Key _neutralKey;
     bool _neutralFilled = false;
