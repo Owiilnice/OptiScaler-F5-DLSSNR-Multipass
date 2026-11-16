@@ -148,13 +148,15 @@ static bool CbIsConstantBuffer(ID3D11Resource* res, UINT* bytes)
         return false;
 
     D3D11_BUFFER_DESC desc {};
-    const bool constant = SUCCEEDED(buffer->GetDesc(&desc)) && (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 &&
-                          desc.ByteWidth >= 64 && desc.ByteWidth <= 16384;
+    buffer->GetDesc(&desc);
+    buffer->Release();
+
+    const bool constant = (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0 && desc.ByteWidth >= 64 &&
+                          desc.ByteWidth <= 16384;
 
     if (constant && bytes != nullptr)
         *bytes = desc.ByteWidth;
 
-    buffer->Release();
     return constant;
 }
 
