@@ -119,6 +119,7 @@ class VirtualUpscalerDriver
     std::atomic<bool> _nrInPlace { false };
     std::atomic<bool> _backendPass { false };
     uint32_t _zeroSizeFrames = 0;
+    uint32_t _jitterFrame = 0; // Halton index for the sub-pixel jitter (VirtualUpscalerDriver.cpp, JitterShift)
     std::string _error;
 };
 

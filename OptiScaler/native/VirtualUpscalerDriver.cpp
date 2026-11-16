@@ -16,6 +16,188 @@
 #include <dlssnr/DlssNr.h>
 #include <dlssnr/DlssNrFeature_Dx12.h>
 
+#include <d3dx/d3dx12.h>
+#include <shaders/Shader_Common.h>
+#include <shaders/Shader_Dx12.h>
+#include <shaders/Shader_Dx12Utils.h>
+
+// Sub-pixel shift of the picture before the backend reads it.
+//
+// DLSS/DLAA needs the frame it is given to be jittered: the jitter moves every pixel's sample position by a fraction of a
+// pixel from frame to frame, and the model accumulates those sub-pixel samples into one clean edge. A game supplies that by
+// offsetting its projection matrix. A game with no upscaler has no such matrix for us, so the shift is applied to the
+// finished picture instead and the same offset is handed over as NVSDK_NGX_Parameter_Jitter_Offset_X/Y.
+//
+// The motion vectors stay unjittered (the producer estimates them on the unshifted picture), so the MVJittered create flag
+// stays off.
+constexpr char kJitterHlsl[] = R"(
+cbuffer Params : register(b0)
+{
+    float OffX;
+    float OffY;
+    float InvW;
+    float InvH;
+};
+Texture2D<float3> Source : register(t0);
+RWTexture2D<float3> Dest : register(u0);
+
+float3 Fetch(int2 c, int2 maxc)
+{
+    c = clamp(c, int2(0, 0), maxc);
+    return Source.Load(int3(c, 0));
+}
+
+[numthreads(16, 16, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    int2 size = int2(round(1.0f / InvW), round(1.0f / InvH));
+
+    if (id.x >= (uint) size.x || id.y >= (uint) size.y)
+        return;
+
+    int2 maxc = size - 1;
+    float2 p = float2(id.xy) - float2(OffX, OffY);
+    float2 fl = floor(p);
+    int2 i0 = int2(fl);
+    float2 f = p - fl;
+
+    float3 c0 = lerp(Fetch(i0, maxc), Fetch(i0 + int2(1, 0), maxc), f.x);
+    float3 c1 = lerp(Fetch(i0 + int2(0, 1), maxc), Fetch(i0 + int2(1, 1), maxc), f.x);
+
+    Dest[id.xy] = lerp(c0, c1, f.y);
+}
+)";
+
+class JitterShift_Dx12 : public Shader_Dx12
+{
+  private:
+    struct alignas(256) InternalConstants
+    {
+        float OffX;
+        float OffY;
+        float InvW;
+        float InvH;
+    };
+
+    static constexpr int kJitterHeaps = 2;
+
+    FrameDescriptorHeap _jitterHeaps[kJitterHeaps];
+    int _jitterCounter = 0;
+
+  public:
+    JitterShift_Dx12(std::string name, ID3D12Device* device) : Shader_Dx12(name, device)
+    {
+        if (device == nullptr)
+            return;
+
+        if (!SetupRootSignature(device, 1, 1, 1))
+        {
+            LOG_WARN("Jitter shift: root signature failed");
+            return;
+        }
+
+        ID3DBlob* blob = CompileShader(kJitterHlsl, "CSMain", "cs_5_0");
+
+        if (blob == nullptr)
+        {
+            LOG_WARN("Jitter shift: the shader did not compile, jitter stays off");
+            return;
+        }
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc {};
+        desc.pRootSignature = _rootSignature;
+        desc.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+
+        auto hr = device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&_pipelineState));
+        blob->Release();
+
+        if (hr != S_OK)
+        {
+            LOG_WARN("Jitter shift: pipeline state failed {0:x}", (unsigned int) hr);
+            return;
+        }
+
+        D3D12_RESOURCE_DESC cbDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(InternalConstants));
+        auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+
+        hr = device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &cbDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                             nullptr, IID_PPV_ARGS(&_constantBuffer));
+
+        if (hr != S_OK)
+        {
+            LOG_WARN("Jitter shift: constants buffer failed {0:x}", (unsigned int) hr);
+            return;
+        }
+
+        _init = InitHeaps(device, _jitterHeaps, kJitterHeaps);
+    }
+
+    bool Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12Resource* src, ID3D12Resource* dst, float offX, float offY,
+                  uint32_t width, uint32_t height)
+    {
+        if (!_init || cmd == nullptr || src == nullptr || dst == nullptr || width == 0 || height == 0)
+            return false;
+
+        _jitterCounter = (_jitterCounter + 1) % kJitterHeaps;
+        FrameDescriptorHeap& heap = _jitterHeaps[_jitterCounter];
+
+        CreateShaderResourceView(_device, src, heap.GetSrvCPU(0));
+        CreateUnorderedAccessView(_device, dst, heap.GetUavCPU(0), 0);
+
+        InternalConstants constants {};
+        constants.OffX = offX;
+        constants.OffY = offY;
+        constants.InvW = 1.0f / (float) width;
+        constants.InvH = 1.0f / (float) height;
+
+        if (!CreateConstantsBuffer(_device, _constantBuffer, constants, heap.GetCbvCPU(0)))
+            return false;
+
+        ID3D12DescriptorHeap* heaps[] = { heap.GetHeapCSU() };
+        cmd->SetDescriptorHeaps(_countof(heaps), heaps);
+        cmd->SetComputeRootSignature(_rootSignature);
+        cmd->SetPipelineState(_pipelineState);
+        cmd->SetComputeRootDescriptorTable(0, heap.GetTableGPUStart());
+        cmd->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
+
+        return true;
+    }
+};
+
+// Halton(2,3): the low-discrepancy sequence DLSS's own jitter uses, in the -0.5..0.5 pixel range.
+float HaltonSequence(int index, int base)
+{
+    float f = 1.0f;
+    float r = 0.0f;
+
+    for (int i = index; i > 0; i /= base)
+    {
+        f /= (float) base;
+        r += f * (float) (i % base);
+    }
+
+    return r;
+}
+
+// One instance per device, for the driver's life.
+JitterShift_Dx12* JitterShiftFor(ID3D12Device* device)
+{
+    static JitterShift_Dx12* instance = nullptr;
+    static ID3D12Device* owner = nullptr;
+
+    if (device == nullptr)
+        return nullptr;
+
+    if (instance == nullptr || owner != device)
+    {
+        instance = new JitterShift_Dx12("JitterShift", device);
+        owner = device;
+        LOG_INFO("Jitter shift: {}", instance->IsInit() ? "ready" : "not available");
+    }
+
+    return instance->IsInit() ? instance : nullptr;
+}
+
 namespace native
 {
 
@@ -443,7 +625,10 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "output"))
         return false;
 
-    if (copyIn && !EnsureTexture(_input, _inputKey, key, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, "input"))
+    // UAV-capable: with the jitter on, this copy is written by JitterShift instead of CopyResource.
+    if (copyIn &&
+        !EnsureTexture(_input, _inputKey, key, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST,
+                       "input"))
         return false;
 
     // The backend and frame generation need depth, NR does not: with none, they get an all-far depth and NR gets none.
@@ -513,12 +698,46 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
     ID3D12Resource* color = frame.color;
     D3D12_RESOURCE_STATES pictureNow = frame.pictureState;
 
+    // Sub-pixel jitter, only with the backend's own pass: a shifted picture handed straight on would make the whole image
+    // wobble, and only a copy we own can be written.
+    float jitterX = 0.0f;
+    float jitterY = 0.0f;
+    JitterShift_Dx12* jitterShift = route == VuNrRoute::BackendPass && copyIn ? JitterShiftFor(_device) : nullptr;
+
+    if (jitterShift != nullptr)
+    {
+        ++_jitterFrame;
+        jitterX = HaltonSequence((int) _jitterFrame, 2) - 0.5f;
+        jitterY = HaltonSequence((int) _jitterFrame, 3) - 0.5f;
+    }
+
     if (copyIn)
     {
-        Transition(cmd, frame.color, pictureNow, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        pictureNow = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        cmd->CopyResource(_input, frame.color);
-        Transition(cmd, _input, D3D12_RESOURCE_STATE_COPY_DEST, inColor);
+        if (jitterShift != nullptr)
+        {
+            Transition(cmd, frame.color, pictureNow, kRead);
+            pictureNow = kRead;
+
+            // _input rests in COPY_DEST (see the end of Run): it has to be a UAV for the shift.
+            Transition(cmd, _input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            if (!jitterShift->Dispatch(cmd, frame.color, _input, jitterX, jitterY, key.width, key.height))
+            {
+                LOG_WARN("Jitter shift: dispatch failed, no jitter this frame");
+                jitterX = 0.0f;
+                jitterY = 0.0f;
+            }
+
+            Transition(cmd, _input, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, inColor);
+        }
+        else
+        {
+            Transition(cmd, frame.color, pictureNow, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            pictureNow = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cmd->CopyResource(_input, frame.color);
+            Transition(cmd, _input, D3D12_RESOURCE_STATE_COPY_DEST, inColor);
+        }
+
         color = _input;
     }
     else
@@ -531,8 +750,8 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
     _params->Set(NVSDK_NGX_Parameter_Depth, frame.depth);
     _params->Set(NVSDK_NGX_Parameter_MotionVectors, frame.motion);
     _params->Set(NVSDK_NGX_Parameter_Output, _output);
-    _params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
-    _params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
+    _params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitterX);
+    _params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitterY);
     _params->Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.0f);
     _params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.0f);
     _params->Set(NVSDK_NGX_Parameter_Reset, frame.reset ? 1u : 0u);
@@ -646,6 +865,9 @@ bool VirtualUpscalerDriver::Run(ID3D12GraphicsCommandList* cmd, const NativeFram
                  _featureKey.depthReversed);
 
     ++_evaluations;
+
+    if (jitterShift != nullptr && (_evaluations < 8 || _evaluations % 300 == 0))
+        LOG_INFO("Jitter shift: {} x {} px", jitterX, jitterY);
 
     // The backend hands its inputs back in the states it took them in.
     Transition(cmd, frame.motion, inMotion, kRead);
