@@ -19,6 +19,7 @@
 #include <dxgi1_6.h>
 
 #include <cmath>
+#include <cstdio>
 #include <unordered_map>
 #include <vector>
 
@@ -137,8 +138,31 @@ static std::vector<CbPending> _cbPending;
 static std::unordered_map<ID3D11Resource*, std::vector<float>> _cbPrev;
 static std::unordered_map<ID3D11Resource*, UINT> _cbSizes;
 static std::unordered_map<ID3D11Resource*, std::vector<uint8_t>> _cbHits;
+static std::unordered_map<ID3D11Resource*, UINT> _cbWrites;
 static int _cbLogged = 0;
 static int _cbSizesLogged = 0;
+static long _cbMapCalls = 0;
+
+// The game does not jitter its projection matrix, so looking for the movement finds nothing. Dump the whole buffer
+// instead and pick the matrix out by its structure: the last row or column holds a -1, and the two scale terms sit in
+// 0.3..4 for a normal field of view.
+static void CbDump(ID3D11Resource* res, UINT bytes, const float* cur, const char* when)
+{
+    const UINT count = bytes / 4;
+    LOG_INFO("CbProbe: dump {:p} {}B at {}, {} floats", (void*) res, bytes, when, count);
+
+    char line[1200];
+
+    for (UINT base = 0; base < count; base += 24)
+    {
+        int len = snprintf(line, sizeof(line), "+%4u:", base);
+
+        for (UINT i = base; i < base + 24 && i < count; i++)
+            len += snprintf(line + len, sizeof(line) - len, " %.5f", cur[i]);
+
+        LOG_INFO("{}", line);
+    }
+}
 
 static bool CbIsConstantBuffer(ID3D11Resource* res, UINT* bytes)
 {
@@ -167,6 +191,7 @@ static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
 
     const UINT count = bytes / 4;
     const float* cur = (const float*) data;
+    const UINT writes = ++_cbWrites[res];
 
     if (_cbSizes.find(res) == _cbSizes.end())
     {
@@ -175,6 +200,13 @@ static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
         if (++_cbSizesLogged <= 12)
             LOG_INFO("CbProbe: constant buffer {}B, first floats {:.4f} {:.4f} {:.4f} {:.4f}", bytes, cur[0], cur[1], cur[2],
                      cur[3]);
+    }
+
+    if (writes == 1 || writes == 200 || writes == 1000 || writes == 2000 || writes == 3000)
+    {
+        char when[32];
+        snprintf(when, sizeof(when), "write %u", writes);
+        CbDump(res, bytes, cur, when);
     }
 
     auto& prev = _cbPrev[res];
@@ -243,6 +275,9 @@ static HRESULT STDMETHODCALLTYPE hkCbMap(ID3D11DeviceContext* ctx, ID3D11Resourc
     const auto hr = o_CbMap(ctx, res, subResource, mapType, flags, mapped);
 
     UINT bytes = 0;
+
+    if ((++_cbMapCalls % 2000) == 0)
+        LOG_INFO("CbProbe: {} Map calls so far, {} distinct constant buffers", _cbMapCalls, _cbSizes.size());
 
     if (SUCCEEDED(hr) && mapped != nullptr && mapped->pData != nullptr && CbIsConstantBuffer(res, &bytes))
     {
