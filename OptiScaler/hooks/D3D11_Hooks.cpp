@@ -136,6 +136,7 @@ struct CbPending
 static std::vector<CbPending> _cbPending;
 static std::unordered_map<ID3D11Resource*, std::vector<float>> _cbPrev;
 static std::unordered_map<ID3D11Resource*, UINT> _cbSizes;
+static std::unordered_map<ID3D11Resource*, std::vector<uint8_t>> _cbHits;
 static int _cbLogged = 0;
 static int _cbSizesLogged = 0;
 
@@ -179,10 +180,20 @@ static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
     if (prev.size() != count)
     {
         prev.assign(cur, cur + count);
+        _cbHits[res].assign(count / 4, 0);
         return;
     }
 
-    for (UINT off = 0; off + 16 <= count && _cbLogged < 40; off += 4)
+    auto& hits = _cbHits[res];
+
+    if (hits.size() != count / 4)
+        hits.assign(count / 4, 0);
+
+    // Most constant buffers are rewritten with the same contents; the scan is the expensive part.
+    if (memcmp(prev.data(), cur, count * sizeof(float)) == 0)
+        return;
+
+    for (UINT off = 0; off + 16 <= count; off += 4)
     {
         int changed = 0;
         int firstIndex = -1;
@@ -200,8 +211,17 @@ static void CbAnalyze(ID3D11Resource* res, const void* data, UINT bytes)
             }
         }
 
-        // A jittered projection matrix moves one or two entries by well under a unit and leaves the rest alone.
-        if (changed >= 1 && changed <= 4 && maxDelta < 0.02f)
+        // A jittered projection matrix moves one or two entries by well under a unit, leaves the rest alone, and does it
+        // again on the next frame. Requiring three frames in a row drops the one-off animation noise.
+        uint8_t& hit = hits[off / 4];
+
+        if (changed < 1 || changed > 4 || maxDelta >= 0.02f)
+        {
+            hit = 0;
+            continue;
+        }
+
+        if (hit < 3 && ++hit == 3 && _cbLogged < 200)
         {
             LOG_INFO("CbProbe: {:p} {}B off {} changed {} first {} maxDelta {:.6f} | {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} "
                      "{:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f}",
